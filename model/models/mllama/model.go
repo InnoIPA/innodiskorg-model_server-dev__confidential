@@ -17,7 +17,7 @@ type Model struct {
 	model.Base
 	model.BytePairEncoding
 
-	*VisionModel `gguf:"v"`
+	*VisionModel `gguf:"v,vision"`
 	*TextModel
 
 	Projector *nn.Linear `gguf:"mm.0"`

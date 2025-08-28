@@ -34,11 +34,7 @@ ollama -v
 
 ### AMD GPU install
 
-If you have an AMD GPU, **also** download and extract the additional ROCm package:
-
-> [!IMPORTANT]
-> The ROCm tgz contains only AMD dependent libraries.  You must extract **both** `ollama-linux-amd64.tgz` and `ollama-linux-amd64-rocm.tgz` into the same location.
-
+If you have an AMD GPU, also download and extract the additional ROCm package:
 
 ```shell
 curl -L https://ollama.com/download/ollama-linux-amd64-rocm.tgz -o ollama-linux-amd64-rocm.tgz

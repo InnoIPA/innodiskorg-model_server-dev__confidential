@@ -18,7 +18,7 @@ type Model struct {
 	model.BytePairEncoding
 	ImageProcessor
 
-	*VisionModel `gguf:"v"`
+	*VisionModel `gguf:"v,vision"`
 	*Projector   `gguf:"mm"`
 	*TextModel
 }

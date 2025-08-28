@@ -44,8 +44,8 @@ func chatPrompt(ctx context.Context, m *Model, tokenize tokenizeFunc, opts *api.
 		thinkVal := false
 		thinkLevel := ""
 		if think != nil {
-			thinkVal = think.Bool()
-			thinkLevel = think.String()
+			thinkVal = think.AsBool()
+			thinkLevel = think.AsString()
 		}
 		var b bytes.Buffer
 		if err := m.Template.Execute(&b, template.Values{Messages: append(system, msgs[i:]...), Tools: tools, Think: thinkVal, ThinkLevel: thinkLevel, IsThinkSet: think != nil}); err != nil {
@@ -105,8 +105,8 @@ func chatPrompt(ctx context.Context, m *Model, tokenize tokenizeFunc, opts *api.
 	thinkVal := false
 	thinkLevel := ""
 	if think != nil {
-		thinkVal = think.Bool()
-		thinkLevel = think.String()
+		thinkVal = think.AsBool()
+		thinkLevel = think.AsString()
 	}
 	if err := m.Template.Execute(&b, template.Values{Messages: append(system, msgs[currMsgIdx:]...), Tools: tools, Think: thinkVal, ThinkLevel: thinkLevel, IsThinkSet: think != nil}); err != nil {
 		return "", nil, err

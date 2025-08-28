@@ -7,11 +7,9 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
-	"math"
 	"slices"
 	"strings"
 
-	"github.com/ollama/ollama/format"
 	"github.com/ollama/ollama/fs/util/bufioutil"
 )
 
@@ -182,7 +180,7 @@ func (kv KV) OllamaEngineRequired() bool {
 		"llama4",
 		"mllama",
 		"qwen25vl",
-		"gptoss", "gpt-oss",
+		"gptoss",
 	}, kv.Architecture())
 }
 
@@ -277,7 +275,7 @@ type Tensor struct {
 
 func (t Tensor) block() (n int) {
 	if _, err := fmt.Sscanf(t.Name, "blk.%d.", &n); err != nil {
-		return math.MaxInt
+		return -1
 	}
 
 	return
@@ -290,24 +288,24 @@ func (t Tensor) blockSize() uint64 {
 func (t TensorType) BlockSize() uint64 {
 	switch t {
 	case
-		TensorTypeF32,
-		TensorTypeF16,
-		TensorTypeI8,
-		TensorTypeI16,
-		TensorTypeI32,
-		TensorTypeI64,
-		TensorTypeF64,
-		TensorTypeBF16:
+		0,  // F32
+		1,  // F16
+		24, // I8
+		25, // I16
+		26, // I32
+		27, // I64
+		28, // F64
+		30: // BF16
 		return 1
 	case
-		TensorTypeQ4_0,
-		TensorTypeQ4_1,
-		TensorTypeQ5_0,
-		TensorTypeQ5_1,
-		TensorTypeQ8_0,
-		TensorTypeQ8_1,
-		tensorTypeIQ4_NL,
-		4, TensorTypeMXFP4:
+		2,  // Q4_0
+		3,  // Q4_1
+		4,  // MXFP4
+		6,  // Q5_0
+		7,  // Q5_1
+		8,  // Q8_0
+		9,  // Q8_1
+		20: // IQ4_NL
 		return 32
 	default:
 		return 256
@@ -330,6 +328,8 @@ func (t TensorType) TypeSize() uint64 {
 		return 2 + blockSize/2
 	case TensorTypeQ4_1:
 		return 2 + 2 + blockSize/2
+	case TensorTypeMXFP4:
+		return 1 + blockSize/2
 	case TensorTypeQ5_0:
 		return 2 + 4 + blockSize/2
 	case TensorTypeQ5_1:
@@ -380,8 +380,6 @@ func (t TensorType) TypeSize() uint64 {
 		return blockSize/8 + blockSize/16 + blockSize/32
 	case TensorTypeBF16:
 		return 2
-	case 4, TensorTypeMXFP4:
-		return 1 + blockSize/2
 	default:
 		return 0
 	}
@@ -481,9 +479,7 @@ func Decode(rs io.ReadSeeker, maxArraySize int) (*GGML, error) {
 	}, nil
 }
 
-func (f GGML) GraphSize(context, batch uint64, numParallel int, kvCacheType string, useFlashAttention bool) (kv []uint64, partialOffload, fullOffload uint64) {
-	context *= uint64(numParallel)
-
+func (f GGML) GraphSize(context, batch uint64, numParallel int, kvCacheType string) (kv []uint64, partialOffload, fullOffload uint64) {
 	embedding := f.KV().EmbeddingLength()
 	heads := f.KV().HeadCountMax()
 	headsKV := f.KV().HeadCountKVMax()
@@ -669,7 +665,7 @@ func (f GGML) GraphSize(context, batch uint64, numParallel int, kvCacheType stri
 					4*qkvBias.Shape[0],
 			)
 		}
-	case "gptoss", "gpt-oss":
+	case "gptoss":
 		kv = make([]uint64, f.KV().BlockCount())
 		for i := range kv {
 			kv[i] = uint64(float64((embeddingHeadsK+embeddingHeadsV)*headsKV) * bytesPerElement)
@@ -679,12 +675,8 @@ func (f GGML) GraphSize(context, batch uint64, numParallel int, kvCacheType stri
 				kv[i] *= context
 			}
 		}
-
-		partialOffload = 2 * f.KV().HeadCountMax() / cmp.Or(f.KV().HeadCountKVMin(), 1) * kvTotal / 6
-		if useFlashAttention {
-			// rough estimate of graph size with flash attention on
-			partialOffload = (4*uint64(numParallel) + context>>10 + 110) * format.MebiByte
-		}
+		fullOffload = 4 * f.KV().HeadCountMax() / cmp.Or(f.KV().HeadCountKVMin(), 1) * kvTotal / 6
+		partialOffload = fullOffload
 	}
 
 	return
@@ -759,11 +751,6 @@ func (llm GGML) VisionGraphSize() (weights, graphSize uint64) {
 
 // SupportsKVCacheType checks if the requested cache type is supported
 func (f GGML) SupportsKVCacheType(cacheType string) bool {
-	if arch := f.KV().Architecture(); slices.Contains([]string{"gptoss", "gpt-oss"}, arch) {
-		// gpt-oss uses attention with sinks which does not support quantized cache types
-		slog.Warn("model only supports non-quantized cache types ", "mode", arch)
-		return cacheType == "f16"
-	}
 	return slices.Contains([]string{"f16", "q8_0", "q4_0"}, cacheType)
 }
 
@@ -774,17 +761,14 @@ func (f GGML) SupportsFlashAttention() bool {
 		return false
 	}
 
+	if f.KV().Architecture() == "gptoss" {
+		return false
+	}
+
 	// Check head counts match and are non-zero
 	headCountK := f.KV().EmbeddingHeadCountK()
 	headCountV := f.KV().EmbeddingHeadCountV()
 	return headCountK != 0 && headCountV != 0 && headCountK == headCountV
-}
-
-// FlashAttention checks if the model should enable flash attention
-func (f GGML) FlashAttention() bool {
-	return slices.Contains([]string{
-		"gptoss", "gpt-oss",
-	}, f.KV().String("general.architecture"))
 }
 
 // kvCacheBytesPerElement returns the number of bytes per element for a given KV cache type

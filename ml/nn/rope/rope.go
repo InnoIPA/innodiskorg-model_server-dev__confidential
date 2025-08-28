@@ -22,7 +22,7 @@ func WithOriginalContextLength(n int) func(*Options) {
 	}
 }
 
-// WithTypeNeoX sets RoPE type to NeoX
+// WithType sets RoPE type to NeoX
 func WithTypeNeoX() func(*Options) {
 	return func(opts *Options) {
 		opts.Type = 2

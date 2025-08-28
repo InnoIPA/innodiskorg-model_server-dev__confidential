@@ -4,7 +4,7 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
-	"sort"
+	"strconv"
 	"strings"
 
 	"github.com/ollama/ollama/api"
@@ -14,79 +14,13 @@ import (
 	"github.com/ollama/ollama/fs/ggml"
 )
 
-// pickBestFullFitByLibrary will try to find the optimal placement of the model in the available GPUs where the model fully fits
-// The list of GPUs returned will always be the same brand (library)
-// If the model can not be fit fully within the available GPU(s) nil is returned
-func pickBestFullFitByLibrary(f *ggml.GGML, modelPath string, projectors []string, adapters []string, opts api.Options, gpus discover.GpuInfoList, numParallel int) discover.GpuInfoList {
-	for _, gl := range gpus.ByLibrary() {
-		sgl := append(make(discover.GpuInfoList, 0, len(gl)), gl...)
-
-		// TODO - potentially sort by performance capability, existing models loaded, etc.
-		// TODO - Eliminate any GPUs that already have envconfig.MaxRunners loaded on them
-		// Note: at present, this will favor most current available VRAM descending and ignoring faster GPU speed in mixed setups
-		sort.Sort(sort.Reverse(discover.ByFreeMemory(sgl)))
-
-		if !envconfig.SchedSpread() {
-			// Try to pack into as few GPUs as possible, starting from 1 GPU
-			for numGPUs := 1; numGPUs <= len(sgl); numGPUs++ {
-				gpuSubset := sgl[:numGPUs]
-				ok, estimatedVRAM := predictServerFit(gpuSubset, f, adapters, projectors, opts, numParallel)
-
-				if ok {
-					slog.Info("new model will fit in available VRAM across minimum required GPUs, loading",
-						"model", modelPath,
-						"library", sgl[0].Library,
-						"parallel", numParallel,
-						"required", format.HumanBytes2(estimatedVRAM),
-						"gpus", numGPUs)
-					return gpuSubset
-				}
-			}
-		} else {
-			// TODO future refinements
-			// - if multiple Libraries, see if any single GPU in any Library will fit
-			// - try subsets of GPUs instead of just falling back to 1 or all in a family
-
-			// Now try all the GPUS (OLLAMA_SCHED_SPREAD is set)
-			if ok, estimatedVRAM := predictServerFit(sgl, f, adapters, projectors, opts, numParallel); ok {
-				slog.Info("new model will fit in available VRAM, loading",
-					"model", modelPath,
-					"library", sgl[0].Library,
-					"parallel", numParallel,
-					"required", format.HumanBytes2(estimatedVRAM),
-					"gpus", len(sgl))
-				return sgl
-			}
-		}
-	}
-	return nil
-}
-
-// If multiple Libraries are detected, pick the Library which loads the most layers for the model
-func pickBestPartialFitByLibrary(f *ggml.GGML, projectors []string, adapters []string, opts api.Options, gpus discover.GpuInfoList, numParallel int) discover.GpuInfoList {
-	byLibrary := gpus.ByLibrary()
-	if len(byLibrary) <= 1 {
-		return gpus
-	}
-	var bestEstimate uint64
-	var bestFit int
-	for i, gl := range byLibrary {
-		_, estimatedVRAM := predictServerFit(gl, f, adapters, projectors, opts, numParallel)
-		if estimatedVRAM > bestEstimate {
-			bestEstimate = estimatedVRAM
-			bestFit = i
-		}
-	}
-	return byLibrary[bestFit]
-}
-
 // This algorithm looks for a complete fit to determine if we need to unload other models
-func predictServerFit(allGpus discover.GpuInfoList, f *ggml.GGML, adapters, projectors []string, opts api.Options, numParallel int) (bool, uint64) {
+func PredictServerFit(allGpus discover.GpuInfoList, f *ggml.GGML, adapters, projectors []string, opts api.Options, numParallel int) (bool, uint64) {
 	// Split up the GPUs by type and try them
 	var estimatedVRAM uint64
 	for _, gpus := range allGpus.ByLibrary() {
 		var layerCount int
-		estimate := estimateGPULayers(gpus, f, projectors, opts, numParallel)
+		estimate := EstimateGPULayers(gpus, f, projectors, opts, numParallel)
 		layerCount, estimatedVRAM = estimate.Layers, estimate.VRAMSize
 		if opts.NumGPU < 0 {
 			if layerCount > 0 && layerCount >= int(f.KV().BlockCount()+1) {
@@ -96,10 +30,6 @@ func predictServerFit(allGpus discover.GpuInfoList, f *ggml.GGML, adapters, proj
 			if layerCount > 0 && layerCount >= opts.NumGPU {
 				return true, estimatedVRAM
 			}
-		}
-
-		if len(gpus) == 1 && gpus[0].Library == "cpu" && estimate.TotalSize <= gpus[0].FreeMemory {
-			return true, estimatedVRAM
 		}
 	}
 	return false, estimatedVRAM
@@ -119,7 +49,7 @@ type MemoryEstimate struct {
 	TotalSize uint64
 
 	// For multi-GPU scenarios, this provides the tensor split parameter
-	TensorSplit []int
+	TensorSplit string
 
 	// For multi-GPU scenarios, this is the size in bytes per GPU
 	GPUSizes []uint64
@@ -141,7 +71,7 @@ type MemoryEstimate struct {
 
 // Given a model and one or more GPU targets, predict how many layers and bytes we can load, and the total size
 // The GPUs provided must all be the same Library
-func estimateGPULayers(gpus []discover.GpuInfo, f *ggml.GGML, projectors []string, opts api.Options, numParallel int) MemoryEstimate {
+func EstimateGPULayers(gpus []discover.GpuInfo, f *ggml.GGML, projectors []string, opts api.Options, numParallel int) MemoryEstimate {
 	// Graph size for a partial offload, applies to all GPUs
 	var graphPartialOffload uint64
 
@@ -182,9 +112,13 @@ func estimateGPULayers(gpus []discover.GpuInfo, f *ggml.GGML, projectors []strin
 
 	for _, projector := range projectors {
 		llamaEngineProjectorWeights += projectorMemoryRequirements(projector)
+
+		// multimodal models require at least 2048 context
+		opts.NumCtx = max(opts.NumCtx, 2048)
 	}
 	if llamaEngineProjectorWeights == 0 {
 		ollamaEngineProjectorWeights, ollamaEngineProjectorGraph = f.VisionGraphSize()
+		opts.NumCtx = max(opts.NumCtx, 2048)
 	}
 
 	layers := f.Tensors().GroupLayers()
@@ -195,19 +129,17 @@ func estimateGPULayers(gpus []discover.GpuInfo, f *ggml.GGML, projectors []strin
 		slog.Warn("model missing blk.0 layer size")
 	}
 
-	useFlashAttention := (envconfig.FlashAttention() || f.FlashAttention()) &&
-		discover.GetGPUInfo().FlashAttentionSupported() &&
-		f.SupportsFlashAttention()
-
 	var kvct string
-	if useFlashAttention {
+	if envconfig.FlashAttention() &&
+		discover.GetGPUInfo().FlashAttentionSupported() &&
+		f.SupportsFlashAttention() {
 		requested := strings.ToLower(envconfig.KvCacheType())
 		if requested != "" && f.SupportsKVCacheType(requested) {
 			kvct = requested
 		}
 	}
 
-	kv, graphPartialOffload, graphFullOffload := f.GraphSize(uint64(opts.NumCtx), uint64(min(opts.NumCtx, opts.NumBatch)), numParallel, kvct, useFlashAttention)
+	kv, graphPartialOffload, graphFullOffload := f.GraphSize(uint64(opts.NumCtx), uint64(min(opts.NumCtx, opts.NumBatch)), numParallel, kvct)
 
 	if len(kv) > 0 {
 		layerSize += kv[0]
@@ -252,7 +184,7 @@ func estimateGPULayers(gpus []discover.GpuInfo, f *ggml.GGML, projectors []strin
 
 	// Reduce set of GPUs to only those that have sufficient space to fit overhead and at least one layer
 	var layerCount int
-	tensorSplit := make([]int, len(gpus))
+	layerCounts := make([]int, len(gpus))
 	gpuAllocations := make([]uint64, len(gpus))
 	type gs struct {
 		i int
@@ -316,7 +248,7 @@ func estimateGPULayers(gpus []discover.GpuInfo, f *ggml.GGML, projectors []strin
 			used := gpuAllocations[g.i] + max(graphPartialOffload, graphFullOffload)
 			if g.g.FreeMemory > overhead+used+layerSize {
 				gpuAllocations[g.i] += layerSize
-				tensorSplit[g.i]++
+				layerCounts[g.i]++
 				layerCount++
 				break
 			} else {
@@ -341,7 +273,7 @@ func estimateGPULayers(gpus []discover.GpuInfo, f *ggml.GGML, projectors []strin
 				used := gpuAllocations[g.i] + max(graphPartialOffload, graphFullOffload)
 				if g.g.FreeMemory > overhead+used+memoryLastLayer {
 					gpuAllocations[g.i] += memoryLastLayer
-					tensorSplit[g.i]++
+					layerCounts[g.i]++
 					layerCount++
 					break
 				}
@@ -356,7 +288,7 @@ func estimateGPULayers(gpus []discover.GpuInfo, f *ggml.GGML, projectors []strin
 
 	// Add the applicable (full or partial) graph allocations
 	for i := range gpus {
-		if tensorSplit[i] <= 0 {
+		if layerCounts[i] <= 0 {
 			continue
 		}
 		if fullyLoaded {
@@ -378,6 +310,14 @@ func estimateGPULayers(gpus []discover.GpuInfo, f *ggml.GGML, projectors []strin
 	}
 	memoryRequiredTotal = memoryRequiredPartial + overflow
 
+	tensorSplit := ""
+	if len(gpus) > 1 {
+		splits := make([]string, len(gpus))
+		for i, count := range layerCounts {
+			splits[i] = strconv.Itoa(count)
+		}
+		tensorSplit = strings.Join(splits, ",")
+	}
 	allocationsList := []string{}
 	for _, a := range gpuAllocations {
 		allocationsList = append(allocationsList, format.HumanBytes2(a))

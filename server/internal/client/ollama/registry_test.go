@@ -468,7 +468,7 @@ func TestErrorUnmarshal(t *testing.T) {
 	}
 }
 
-// TestParseNameExtendedErrors tests that parseName returns errors messages with enough
+// TestParseNameErrors tests that parseName returns errors messages with enough
 // detail for users to debug naming issues they may encounter. Previous to this
 // test, the error messages were not very helpful and each problem was reported
 // as the same message.
